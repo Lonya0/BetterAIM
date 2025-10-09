@@ -51,14 +51,14 @@ def save_chat_history(sha_id: str, history: List[List[str]]):
         print(f"保存聊天历史失败: {e}")
 
 
-def login(session_id: str, mcp_tools_url) -> Tuple[
+def login(session_id: str, mcp_tools_url: str, agent_info: dict) -> Tuple[
     gr.update, gr.update, str, List[List[str]]]:
     """处理登录逻辑"""
 
     if not session_id:
         return gr.update(visible=True), gr.update(visible=False), "请填写或自动生成会话ID", []
-    elif session_id.__len__() != 20 or session_id.__class__() != str:
-        return gr.update(visible=True), gr.update(visible=False), "会话ID需要为长度为20的字符串", []
+    elif len(session_id) != 20:
+        return gr.update(visible=True), gr.update(visible=False), f"会话ID需要为长度为20的任意字符，目前长度：{len(session_id)}", []
 
     # 生成SHA ID
     sha_id = session_id
@@ -66,7 +66,7 @@ def login(session_id: str, mcp_tools_url) -> Tuple[
     # 创建或获取agent
     if sha_id not in active_agents:
         try:
-            agent = create_llm_agent(session_id, mcp_tools_url)
+            agent = create_llm_agent(session_id, mcp_tools_url, agent_info=agent_info)
             active_agents[sha_id] = agent
         except Exception as e:
             return gr.update(visible=True), gr.update(visible=False), f"创建Agent失败: {str(e)}", []
@@ -152,62 +152,62 @@ def logout() -> Tuple[gr.update, gr.update, str, List[List[str]], str]:
 
 def create_interface(mcp_tools_url: str, agent_info: dict):
     """创建Gradio界面"""
-    with gr.Blocks(title="DeePTB Agent", theme=gr.themes.Soft()) as demo:
+    with gr.Blocks(title=agent_info["name"], theme=gr.themes.Soft()) as demo:
         # 状态变量
         session_id_state = gr.State("")
         mcp_tools_url_state = gr.State(mcp_tools_url)
+        agent_info_state = gr.State(agent_info)
 
-        gr.Markdown("# DeePTB Agent")
+        gr.Markdown(f"# {agent_info['name']}")
 
         with gr.Column(visible=True) as login_section:
             gr.Markdown("## 创建会话")
 
-            with gr.Row():
-                with gr.Column():
-                    with gr.Row():
-                        session_id = gr.Textbox(label="会话ID", placeholder="请输入20位任意字符串", scale=4)
-                        generate_btn = gr.Button("随机生成", size="sm", scale=1, min_width=100)
-                    gr.Text(value="输入或自动生成20位任意字符串作为您的专属会话ID，使用相同ID可以访问此前的历史记录，历史记录在一小时后会被自动清除，请不要传播您专属的ID！")
+            with gr.Row(equal_height=True):
+                session_id = gr.Textbox(label="会话ID", placeholder="请输入20位任意字符串", scale=4)
+                generate_btn = gr.Button("随机生成", scale=1, min_width=100, variant="primary")
 
-                    login_btn = gr.Button("登录", variant="primary")
+            gr.Markdown("输入或自动生成20位任意字符串作为您的专属会话ID，使用相同ID可以访问此前的历史记录，历史记录在一小时后会被自动清除，请不要传播您专属的ID！")
+
+            login_btn = gr.Button("进入会话", variant="primary")
 
             status_msg = gr.Textbox(label="状态", interactive=False)
 
         with gr.Column(visible=False) as chat_section:
-            with gr.Column() as main_column:
-                gr.Markdown("## 与DeePTB Agent协作")
+            with gr.Row():
+                with gr.Column(scale=2) as main_column:
+                    gr.Markdown(f"## 与{agent_info['name']}协作")
 
-                # 显示当前用户和项目信息
-                current_info = gr.Textbox(
-                    label="当前会话信息",
-                    interactive=False,
-                    value=""
-                )
+                    # 显示当前用户和项目信息
+                    current_info = gr.Textbox(
+                        label="当前会话信息",
+                        interactive=False,
+                        value=""
+                    )
 
-                with gr.Row():
                     chatbot = gr.Chatbot(
                         label="聊天记录",
                         height=900,
                         show_copy_button=True
                     )
-                    gr.ChatInterface()
 
-                with gr.Row():
-                    msg = gr.Textbox(
-                        label="输入消息",
-                        placeholder="输入你想对DeePTB Agent说的话...",
-                        scale=4
-                    )
-                    send_btn = gr.Button("发送", variant="primary", scale=1)
+                    with gr.Row(equal_height=True):
+                        msg = gr.Textbox(
+                            label="输入消息",
+                            placeholder=f"输入你想对{agent_info['name']}说的话...",
+                            scale=4
+                        )
+                        send_btn = gr.Button("发送", variant="primary", scale=1)
 
-                with gr.Row():
-                    clear_btn = gr.Button("清空对话")
-                    logout_btn = gr.Button("离开会话", variant="secondary")
+                    with gr.Row():
+                        clear_btn = gr.Button("清空对话")
+                        logout_btn = gr.Button("离开会话", variant="secondary")
 
-                chat_status = gr.Textbox(label="聊天状态", interactive=False)
+                    chat_status = gr.Textbox(label="聊天状态", interactive=False)
 
-            with gr.Column() as values_column:
-                gr.Text(value="当调用mcp工具时，将会弹出参数的确认或手动修改")
+                with gr.Column(scale=1) as values_column:
+                    gr.Markdown("## 修改运行参数")
+                    gr.Text(value="当调用mcp工具时，将会弹出参数的确认或手动修改")
 
         def on_generate_click():
             """当生成按钮被点击时的回调函数"""
@@ -226,7 +226,7 @@ def create_interface(mcp_tools_url: str, agent_info: dict):
         # 登录按钮事件
         login_btn.click(
             fn=login,
-            inputs=[session_id, mcp_tools_url_state],
+            inputs=[session_id, mcp_tools_url_state, agent_info_state],
             outputs=[login_section, chat_section, status_msg, chatbot]
         ).then(
             lambda _session_id:
