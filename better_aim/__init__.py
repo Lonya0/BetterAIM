@@ -1,0 +1,1 @@
+from better_aim.main import launch
