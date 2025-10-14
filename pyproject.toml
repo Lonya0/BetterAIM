@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "better_aim"
 dynamic = ["version"]
 description = "better_aim"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 dependencies = [
     "LiteLlm",
     "google-adk",

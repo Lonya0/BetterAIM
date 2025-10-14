@@ -3,6 +3,7 @@ import json
 import os
 from typing import Dict, List, Tuple, Any, AsyncGenerator
 from better_aim.agent import create_llm_agent
+from better_aim.adjustable_session_service import pop_event
 from google.adk.agents import LlmAgent
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
