@@ -1,7 +1,7 @@
 import gradio as gr
 import json
 import os
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Any, AsyncGenerator
 from better_aim.agent import create_llm_agent
 from google.adk.agents import LlmAgent
 from google.adk.runners import Runner
@@ -16,20 +16,23 @@ session_service = InMemorySessionService()
 # 全局变量存储活跃的agents
 active_agents: Dict[str, LlmAgent] = {}
 
+# 全局事件池，用于控制暂停与恢复
+pending_events = {}  # session_id -> asyncio.Event
+modified_args_store = {}  # 临时存储修改后的参数
+intercept_state = {}
 
-history_file_path = './chat_history'
 
-
-def get_chat_history_file_path(sha_id: str) -> str:
+def get_chat_history_file_path(sha_id: str, work_path: str) -> str:
     """获取聊天历史文件路径"""
     # 确保文件路径存在
+    history_file_path = os.path.join(work_path, "chat_history")
     os.makedirs(history_file_path, exist_ok=True)
-    return os.path.join(history_file_path, f"{sha_id[:16]}.json")
+    return os.path.join(history_file_path, f"{sha_id}.json")
 
 
-def load_chat_history(sha_id: str) -> List[List[str]]:
+def load_chat_history(sha_id: str, work_path: str) -> List[List[str]]:
     """加载聊天历史记录"""
-    history_file = get_chat_history_file_path(sha_id)
+    history_file = get_chat_history_file_path(sha_id, work_path)
 
     if os.path.exists(history_file):
         try:
@@ -40,9 +43,9 @@ def load_chat_history(sha_id: str) -> List[List[str]]:
     return []
 
 
-def save_chat_history(sha_id: str, history: List[List[str]]):
+def save_chat_history(sha_id: str, history: List[List[str]], work_path: str):
     """保存聊天历史记录"""
-    history_file = get_chat_history_file_path(sha_id)
+    history_file = get_chat_history_file_path(sha_id, work_path)
 
     try:
         with open(history_file, 'w', encoding='utf-8') as f:
@@ -51,14 +54,16 @@ def save_chat_history(sha_id: str, history: List[List[str]]):
         print(f"保存聊天历史失败: {e}")
 
 
-def login(session_id: str, mcp_tools_url) -> Tuple[
+def login(session_id: str, mcp_tools_url: str, agent_info: dict, work_path: str) -> Tuple[
     gr.update, gr.update, str, List[List[str]]]:
     """处理登录逻辑"""
 
+    print(work_path)
+
     if not session_id:
         return gr.update(visible=True), gr.update(visible=False), "请填写或自动生成会话ID", []
-    elif session_id.__len__() != 20 or session_id.__class__() != str:
-        return gr.update(visible=True), gr.update(visible=False), "会话ID需要为长度为20的字符串", []
+    elif len(session_id) != 20:
+        return gr.update(visible=True), gr.update(visible=False), f"会话ID需要为长度为20的任意字符，目前长度：{len(session_id)}", []
 
     # 生成SHA ID
     sha_id = session_id
@@ -66,7 +71,7 @@ def login(session_id: str, mcp_tools_url) -> Tuple[
     # 创建或获取agent
     if sha_id not in active_agents:
         try:
-            agent = create_llm_agent(session_id, mcp_tools_url)
+            agent = create_llm_agent(session_id, mcp_tools_url, agent_info=agent_info)
             active_agents[sha_id] = agent
         except Exception as e:
             return gr.update(visible=True), gr.update(visible=False), f"创建Agent失败: {str(e)}", []
@@ -74,7 +79,7 @@ def login(session_id: str, mcp_tools_url) -> Tuple[
         agent = active_agents[sha_id]
 
     # 加载聊天历史
-    chat_history = load_chat_history(sha_id)
+    chat_history = load_chat_history(sha_id, work_path)
 
     # 返回更新后的界面和状态
     return (
@@ -84,7 +89,19 @@ def login(session_id: str, mcp_tools_url) -> Tuple[
         chat_history  # 聊天历史
     )
 
-# from https://google.github.io/adk-docs/tutorials/agent-team/#step-1-your-first-agent-basic-weather-lookup
+def on_function_call_intercept(func_call, session_id):
+    # 这个函数会在拦截时被调用，用来更新Gradio界面
+    # 例如显示一个确认按钮
+    intercept_state[session_id] = func_call
+
+def on_confirm_click(session_id, new_args):
+    # 用户点击按钮时执行
+    modified_args_store[session_id] = new_args or intercept_state[session_id].args
+    if session_id in pending_events:
+        pending_events[session_id].set()  # ✅ 解除暂停
+    return "已确认执行函数调用"
+
+# modified from https://google.github.io/adk-docs/tutorials/agent-team/#step-1-your-first-agent-basic-weather-lookup
 async def call_agent_async(query: str, runner, user_id, session_id):
     """Sends a query to the agent and prints the final response."""
     #print(f"\n>>> User Query: {query}")
@@ -98,26 +115,66 @@ async def call_agent_async(query: str, runner, user_id, session_id):
     # We iterate through events to find the final answer.
     async for event in runner.run_async(user_id=user_id, session_id=session_id, new_message=content):
         # You can uncomment the line below to see *all* events during execution
-        # print(f"  [Event] Author: {event.author}, Type: {type(event).__name__}, Final: {event.is_final_response()}, Content: {event.content}")
+        #print(f"  [Event] Author: {event.author}, Type: {type(event).__name__}, Final: {event.is_final_response()}, Content: {event.content}, a:{event.content.parts}")
+
+        # 检测 function call
+        # https://google.github.io/adk-docs/events/#identifying-event-origin-and-type
+        if event.content and event.content.parts:
+            calls = event.get_function_calls()
+            if calls:
+                for call in calls:
+                    tool_name = call.name
+                    arguments = call.args  # This is usually a dictionary
+                    print(f"  Tool: {tool_name}, Args: {arguments}")
+                    # Application might dispatch execution based on this
+
+                    
+                    print(await session_service.list_sessions(app_name=runner.app_name, user_id=user_id))
+                    print("-"*100)
+                    print(session_service.get_session_sync(app_name=runner.app_name, user_id=user_id, session_id=session_id))
+
+                    # 在此处可修改参数，例如修改材料或路径
+                    if on_function_call_intercept:
+                        on_function_call_intercept(call, session_id)
+
+                    pending_events[session_id] = asyncio.Event()
+                    print("等待用户点击按钮以继续执行...")
+                    await pending_events[session_id].wait()  # ⏸ 暂停在这里直到按钮被点击
+                    print("✅ 用户已点击按钮，继续执行")
+
+                    # 构造一个新的 Content，模拟修改后的输入重新发送给 agent
+                    modified_content = types.Content(role="user", parts=[
+                        types.Part(
+                            text=f"请改为使用修改后的参数:"
+                        )
+                    ])
+
+                    # 再次调用 runner，继续对话
+                    async for follow_event in runner.run_async(user_id=user_id, session_id=session_id,
+                                                               new_message=modified_content):
+                        if follow_event.is_final_response():
+                            yield follow_event.content.parts[0].text
+                            return
+                    return
 
         # Key Concept: is_final_response() marks the concluding message for the turn.
         if event.is_final_response():
             if event.content and event.content.parts:
                 # Assuming text response in the first part
-                final_response_text = event.content.parts[0].text
+                yield event.content.parts[0].text
             elif event.actions and event.actions.escalate: # Handle potential errors/escalations
-                final_response_text = f"Agent escalated: {event.error_message or 'No specific message.'}"
+                yield f"Agent escalated: {event.error_message or 'No specific message.'}"
             # Add more checks here if needed (e.g., specific error codes)
             break # Stop processing events once the final response is found
 
     #print(f"<<< Agent Response: {final_response_text}")
-    return final_response_text
 
-async def chat_with_agent(message: str, history: List[List[str]], session_id: str, agent_info: dict) -> Tuple[
-    List[List[str]], str]:
+
+async def chat_with_agent(message: str, history: List[List[str]], session_id: str, agent_info: dict, work_path: str) -> \
+AsyncGenerator[tuple[list[list[str]], str], Any]:
     """处理与agent的聊天"""
     if session_id not in active_agents:
-        return history, "Agent未找到，请重新登录"
+        yield history, "Agent未找到，请重新登录"
 
     agent = active_agents[session_id]
     session = await session_service.create_session(app_name=agent_info["name"],
@@ -128,15 +185,14 @@ async def chat_with_agent(message: str, history: List[List[str]], session_id: st
                     app_name=agent_info["name"],
                     session_service=session_service)
 
-    final_response_text = await call_agent_async(query=message, runner=runner, user_id=session_id[:4], session_id=session_id)
+    async for response in call_agent_async(query=message, runner=runner, user_id=session_id[:4], session_id=session_id):
+        # 更新聊天历史
+        new_history = history + [[message, response]]
 
-    # 更新聊天历史
-    new_history = history + [[message, final_response_text]]
+        # 保存聊天历史
+        save_chat_history(session_id, new_history, work_path)
 
-    # 保存聊天历史
-    save_chat_history(session_id, new_history)
-
-    return new_history, ""
+        yield new_history, ""
 
 
 
@@ -150,64 +206,67 @@ def logout() -> Tuple[gr.update, gr.update, str, List[List[str]], str]:
         ""# 清空登录表单
     )
 
-def create_interface(mcp_tools_url: str, agent_info: dict):
+def create_interface(mcp_tools_url: str, agent_info: dict, work_path: str):
     """创建Gradio界面"""
-    with gr.Blocks(title="DeePTB Agent", theme=gr.themes.Soft()) as demo:
+    with gr.Blocks(title=agent_info["name"], theme=gr.themes.Soft()) as demo:
         # 状态变量
         session_id_state = gr.State("")
         mcp_tools_url_state = gr.State(mcp_tools_url)
+        agent_info_state = gr.State(agent_info)
+        work_path_state = gr.State(work_path)
 
-        gr.Markdown("# DeePTB Agent")
+        gr.Markdown(f"# {agent_info['name']}")
 
         with gr.Column(visible=True) as login_section:
             gr.Markdown("## 创建会话")
 
-            with gr.Row():
-                with gr.Column():
-                    with gr.Row():
-                        session_id = gr.Textbox(label="会话ID", placeholder="请输入20位任意字符串", scale=4)
-                        generate_btn = gr.Button("随机生成", size="sm", scale=1, min_width=100)
-                    gr.Text(value="输入或自动生成20位任意字符串作为您的专属会话ID，使用相同ID可以访问此前的历史记录，历史记录在一小时后会被自动清除，请不要传播您专属的ID！")
+            with gr.Row(equal_height=True):
+                session_id = gr.Textbox(label="会话ID", placeholder="请输入20位任意字符串", scale=4)
+                generate_btn = gr.Button("随机生成", scale=1, min_width=100, variant="primary")
 
-                    login_btn = gr.Button("登录", variant="primary")
+            gr.Markdown("输入或自动生成20位任意字符串作为您的专属会话ID，使用相同ID可以访问此前的历史记录，历史记录在一小时后会被自动清除，请不要传播您专属的ID！")
+
+            login_btn = gr.Button("进入会话", variant="primary")
 
             status_msg = gr.Textbox(label="状态", interactive=False)
 
         with gr.Column(visible=False) as chat_section:
-            with gr.Column() as main_column:
-                gr.Markdown("## 与DeePTB Agent协作")
+            with gr.Row():
+                with gr.Column(scale=2) as main_column:
+                    gr.Markdown(f"## 与{agent_info['name']}协作")
 
-                # 显示当前用户和项目信息
-                current_info = gr.Textbox(
-                    label="当前会话信息",
-                    interactive=False,
-                    value=""
-                )
+                    # 显示当前用户和项目信息
+                    current_info = gr.Textbox(
+                        label="当前会话信息",
+                        interactive=False,
+                        value=""
+                    )
 
-                with gr.Row():
                     chatbot = gr.Chatbot(
                         label="聊天记录",
                         height=900,
                         show_copy_button=True
                     )
-                    gr.ChatInterface()
 
-                with gr.Row():
-                    msg = gr.Textbox(
-                        label="输入消息",
-                        placeholder="输入你想对DeePTB Agent说的话...",
-                        scale=4
-                    )
-                    send_btn = gr.Button("发送", variant="primary", scale=1)
+                    with gr.Row(equal_height=True):
+                        msg = gr.Textbox(
+                            label="输入消息",
+                            placeholder=f"输入你想对{agent_info['name']}说的话...",
+                            scale=4
+                        )
+                        send_btn = gr.Button("发送", variant="primary", scale=1)
 
-                with gr.Row():
-                    clear_btn = gr.Button("清空对话")
-                    logout_btn = gr.Button("离开会话", variant="secondary")
+                    with gr.Row():
+                        clear_btn = gr.Button("清空对话")
+                        logout_btn = gr.Button("离开会话", variant="secondary")
 
-                chat_status = gr.Textbox(label="聊天状态", interactive=False)
+                    chat_status = gr.Textbox(label="聊天状态", interactive=False)
 
-            with gr.Column() as values_column:
-                gr.Text(value="当调用mcp工具时，将会弹出参数的确认或手动修改")
+                with gr.Column(scale=1) as values_column:
+                    gr.Markdown("## 修改运行参数")
+                    gr.Markdown("当调用mcp工具时，将会弹出参数的确认或手动修改")
+                    with gr.Blocks() as values_block:
+                        pass
 
         def on_generate_click():
             """当生成按钮被点击时的回调函数"""
@@ -226,11 +285,11 @@ def create_interface(mcp_tools_url: str, agent_info: dict):
         # 登录按钮事件
         login_btn.click(
             fn=login,
-            inputs=[session_id, mcp_tools_url_state],
+            inputs=[session_id, mcp_tools_url_state, agent_info_state, work_path_state],
             outputs=[login_section, chat_section, status_msg, chatbot]
         ).then(
             lambda _session_id:
-            ({"session_id": _session_id},
+            (_session_id,
              f"会话ID: {_session_id}"),
             inputs=[session_id],
             outputs=[session_id_state, current_info]
@@ -239,9 +298,9 @@ def create_interface(mcp_tools_url: str, agent_info: dict):
         # 发送消息事件
         async def handle_send_message(message, history, _session_id):
             if not message.strip():
-                return history, "消息不能为空"
-            new_history, status = await chat_with_agent(message, history, session_id=_session_id, agent_info=agent_info)
-            return new_history, status
+                yield history, "消息不能为空"
+            async for new_history, status in chat_with_agent(message, history, session_id=_session_id, agent_info=agent_info, work_path=work_path):
+                yield new_history, status
 
         send_btn.click(
             fn=handle_send_message,

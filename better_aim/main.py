@@ -58,7 +58,8 @@ def launch(agent_info: dict,
            share_mode: bool=False,
            debug_mode: bool=False,
            mcp_tools_url: str="http://0.0.0.0:50001/sse",
-           api_key: str=None):
+           api_key: str=None,
+           work_path: str='/tmp'):
     # 设置API密钥（命令行参数优先）
     if api_key:
         os.environ["GOOGLE_API_KEY"] = api_key
@@ -66,9 +67,10 @@ def launch(agent_info: dict,
         print("警告: GOOGLE_API_KEY环境变量未设置，请通过--api-key参数设置或设置环境变量")
 
     # 创建并启动界面
-    demo = create_interface(mcp_tools_url=mcp_tools_url, agent_info=agent_info)
+    demo = create_interface(mcp_tools_url=mcp_tools_url, agent_info=agent_info, work_path=work_path)
+    os.chdir(work_path)
 
-    print(f"启动参数: 主机={host}, 端口={port}, 分享={share_mode}, 调试={debug_mode}")
+    print(f"启动参数: 主机={host}, 端口={port}, 分享={share_mode}, 调试={debug_mode}, 工作路径={work_path}")
 
     try:
         demo.launch(
@@ -90,6 +92,8 @@ def main():
         print("未找到`.env`文件或无任何变量被读入")
 
     args = parse_arguments()
+
+    launch()
 
 
 

@@ -21,7 +21,7 @@ def create_llm_agent(session_id: str, mcp_tools_url: str, agent_info: dict) -> L
 
     agent = LlmAgent(
         model=LiteLlm(**model_config),
-        name=f"{agent_info['name']}_{session_id}",
+        name=f"{agent_info['name'].replace('-','_')}_{session_id}",
         description=agent_info['description'],
         instruction=agent_info['instruction'],
         tools=[mcp_tools(mcp_tools_url=mcp_tools_url)]

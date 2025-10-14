@@ -6,7 +6,7 @@ agent_info = {
     "instruction": "b"
 }
 
-mcp_tools_url = "http://0.0.0.0:50001:sse"
+mcp_tools_url = "http://0.0.0.0:50001/sse"
 
 launch(agent_info=agent_info,
        debug_mode=True,
