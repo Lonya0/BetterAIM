@@ -20,7 +20,7 @@ active_agents: Dict[str, LlmAgent] = {}
 # 全局事件池，用于控制暂停与恢复
 pending_events = {}  # session_id -> asyncio.Event
 modified_args_store = {}  # 临时存储修改后的参数
-intercept_state = {}
+modified_schema_store = {}  # 临时存储修改后的参数
 
 
 def get_chat_history_file_path(sha_id: str, work_path: str) -> str:
@@ -55,7 +55,11 @@ def save_chat_history(sha_id: str, history: List[List[str]], work_path: str):
         print(f"保存聊天历史失败: {e}")
 
 
-def login(session_id: str, mcp_tools_url: str, agent_info: dict, work_path: str) -> Tuple[
+def login(session_id: str,
+          mcp_tools_url: str,
+          agent_info: dict,
+          work_path: str,
+          model_config: dict) -> Tuple[
     gr.update, gr.update, str, List[List[str]]]:
     """处理登录逻辑"""
 
@@ -72,7 +76,10 @@ def login(session_id: str, mcp_tools_url: str, agent_info: dict, work_path: str)
     # 创建或获取agent
     if sha_id not in active_agents:
         try:
-            agent = create_llm_agent(session_id, mcp_tools_url, agent_info=agent_info)
+            agent = create_llm_agent(session_id=session_id,
+                                     mcp_tools_url=mcp_tools_url,
+                                     agent_info=agent_info,
+                                     model_config=model_config)
             active_agents[sha_id] = agent
         except Exception as e:
             return gr.update(visible=True), gr.update(visible=False), f"创建Agent失败: {str(e)}", []
@@ -90,20 +97,82 @@ def login(session_id: str, mcp_tools_url: str, agent_info: dict, work_path: str)
         chat_history  # 聊天历史
     )
 
-def on_function_call_intercept(func_call, session_id):
-    # 这个函数会在拦截时被调用，用来更新Gradio界面
-    # 例如显示一个确认按钮
-    intercept_state[session_id] = func_call
+def zip_tool_schema(tool_name, arguments, tools_dict):
+    """
+    根据工具名称和参数准备工具模式
 
-def on_confirm_click(session_id, new_args):
-    # 用户点击按钮时执行
-    modified_args_store[session_id] = new_args or intercept_state[session_id].args
-    if session_id in pending_events:
-        pending_events[session_id].set()  # ✅ 解除暂停
-    return "已确认执行函数调用"
+    Args:
+        tool_name: 工具名称
+        arguments: 参数字典
+        tools_dict: 工具字典列表
+
+    Returns:
+        包含agent_input的更新后的工具模式字典，如果未找到工具则返回None
+    """
+    # 在工具字典中查找匹配的工具
+    tool_info = None
+    for tool in tools_dict:
+        if tool.get('name') == tool_name:
+            tool_info = tool.copy()  # 创建副本以避免修改原始数据
+            break
+
+    if tool_info is None:
+        return None
+
+    # 如果有input_schema且包含properties，则插入agent_input字段
+    if 'input_schema' in tool_info and 'properties' in tool_info['input_schema']:
+        properties = tool_info['input_schema']['properties']
+
+        for prop_name, prop_value in properties.items():
+            if prop_name in arguments:
+                # 在属性字典中插入agent_input，保持原有结构
+                prop_value = prop_value.copy()  # 创建属性副本
+                prop_value['agent_input'] = arguments[prop_name]
+                properties[prop_name] = prop_value
+
+    return tool_info
+
+def extract_arguments_from_schema(tool_schema):
+    """
+    从工具模式中提取user_input并生成arguments字典
+
+    Args:
+        tool_schema: 包含input_schema的工具模式字典
+
+    Returns:
+        包含所有user_input值的参数字典
+    """
+    try:
+        arguments = {}
+
+        # 检查输入有效性
+        if not tool_schema or not isinstance(tool_schema, dict):
+            return arguments
+
+        if 'input_schema' not in tool_schema or not isinstance(tool_schema['input_schema'], dict):
+            return arguments
+
+        input_schema = tool_schema['input_schema']
+
+        if 'properties' not in input_schema or not isinstance(input_schema['properties'], dict):
+            return arguments
+
+        properties = input_schema['properties']
+
+        # 遍历所有属性，提取user_input
+        for prop_name, prop_value in properties.items():
+            if (isinstance(prop_value, dict) and
+                    'user_input' in prop_value):
+                arguments[prop_name] = prop_value['user_input']
+
+        return arguments
+
+    except Exception as e:
+        print(f"提取参数时发生错误: {e}")
+        return {}
 
 # modified from https://google.github.io/adk-docs/tutorials/agent-team/#step-1-your-first-agent-basic-weather-lookup
-async def call_agent_async(query: str, runner, user_id, session_id):
+async def call_agent_async(query: str, runner, user_id, session_id, tools_info: List[Dict[str, Any]]):
     """Sends a query to the agent and prints the final response."""
     #print(f"\n>>> User Query: {query}")
 
@@ -129,53 +198,64 @@ async def call_agent_async(query: str, runner, user_id, session_id):
                     print(f"  Tool: {tool_name}, Args: {arguments}")
                     # Application might dispatch execution based on this
 
-                    
-                    print(await session_service.list_sessions(app_name=runner.app_name, user_id=user_id))
-                    print("-"*100)
-                    print(session_service.get_session_sync(app_name=runner.app_name, user_id=user_id, session_id=session_id))
+                    session = session_service.get_session_sync(app_name=runner.app_name,
+                                                               user_id=user_id,
+                                                               session_id=session_id)
 
-                    # 在此处可修改参数，例如修改材料或路径
-                    if on_function_call_intercept:
-                        on_function_call_intercept(call, session_id)
+                    last_event = await pop_event(session_service=session_service, session=session)
+                    print(last_event)
+
+                    schema = zip_tool_schema(tool_name=tool_name,
+                                             arguments=arguments,
+                                             tools_dict=tools_info)
+
+                    yield event.content.parts[0].text, schema, False
 
                     pending_events[session_id] = asyncio.Event()
                     print("等待用户点击按钮以继续执行...")
                     await pending_events[session_id].wait()  # ⏸ 暂停在这里直到按钮被点击
                     print("✅ 用户已点击按钮，继续执行")
 
-                    # 构造一个新的 Content，模拟修改后的输入重新发送给 agent
-                    modified_content = types.Content(role="user", parts=[
-                        types.Part(
-                            text=f"请改为使用修改后的参数:"
-                        )
-                    ])
+                    last_event.content.parts[1].function_call.args = modified_args_store[session_id]
+                    print(modified_args_store)
+                    print("----")
+                    print(last_event.content.parts[1].function_call.args)
+                    await session_service.append_event(session=session, event=last_event)
+                    print(session)
+                # 继续对话
+                continue
 
-                    # 再次调用 runner，继续对话
-                    async for follow_event in runner.run_async(user_id=user_id, session_id=session_id,
-                                                               new_message=modified_content):
-                        if follow_event.is_final_response():
-                            yield follow_event.content.parts[0].text
-                            return
-                    return
+        session = session_service.get_session_sync(app_name=runner.app_name,
+                                                   user_id=user_id,
+                                                   session_id=session_id)
+        print(f"----------------------{session}")
 
         # Key Concept: is_final_response() marks the concluding message for the turn.
         if event.is_final_response():
             if event.content and event.content.parts:
                 # Assuming text response in the first part
-                yield event.content.parts[0].text
+                yield event.content.parts[0].text, {}, True
             elif event.actions and event.actions.escalate: # Handle potential errors/escalations
-                yield f"Agent escalated: {event.error_message or 'No specific message.'}"
+                yield f"Agent escalated: {event.error_message or 'No specific message.'}", {}, True
             # Add more checks here if needed (e.g., specific error codes)
             break # Stop processing events once the final response is found
+        else:
+            if event.content and event.content.parts:
+                yield event.content.parts[0].text, {}, False
 
     #print(f"<<< Agent Response: {final_response_text}")
 
 
-async def chat_with_agent(message: str, history: List[List[str]], session_id: str, agent_info: dict, work_path: str) -> \
-AsyncGenerator[tuple[list[list[str]], str], Any]:
+async def chat_with_agent(message: str,
+                          history: List[List[str]],
+                          session_id: str,
+                          agent_info: dict,
+                          work_path: str,
+                          tools_info: List[Dict[str, Any]]) -> \
+AsyncGenerator[tuple[list[list[str]], str, Dict, bool], Any]:
     """处理与agent的聊天"""
     if session_id not in active_agents:
-        yield history, "Agent未找到，请重新登录"
+        yield history, "Agent未找到，请重新登录", {}, True
 
     agent = active_agents[session_id]
     session = await session_service.create_session(app_name=agent_info["name"],
@@ -186,15 +266,33 @@ AsyncGenerator[tuple[list[list[str]], str], Any]:
                     app_name=agent_info["name"],
                     session_service=session_service)
 
-    async for response in call_agent_async(query=message, runner=runner, user_id=session_id[:4], session_id=session_id):
+    responses = []
+
+    async for response, schema, is_final in call_agent_async(query=message,
+                                                             runner=runner,
+                                                             user_id=session_id[:4],
+                                                             session_id=session_id,
+                                                             tools_info=tools_info):
         # 更新聊天历史
-        new_history = history + [[message, response]]
+        if response:
+            if len(responses) == 0:
+                responses.append([message, response])
+            else:
+                responses.append([None, response])
+            new_history = history + responses
+        else:
+            new_history = history
 
         # 保存聊天历史
         save_chat_history(session_id, new_history, work_path)
 
-        yield new_history, ""
-
+        if schema == {}:
+            if is_final:
+                yield new_history, "待机中。", schema, True
+            else:
+                yield new_history, "正在等待LLM回复……", schema, False
+        else:
+            yield new_history, "正在等待用户调整输入变量……", schema, False
 
 
 def logout() -> Tuple[gr.update, gr.update, str, List[List[str]], str]:
@@ -207,14 +305,148 @@ def logout() -> Tuple[gr.update, gr.update, str, List[List[str]], str]:
         ""# 清空登录表单
     )
 
-def create_interface(mcp_tools_url: str, agent_info: dict, work_path: str):
+def collect_inputs(schema, _session_id, *values):
+    print(f"aaaaaaaaaaaaaa{len(schema['input_schema']['properties'])},bbbbbbbbbbbbbb{len(values)}")
+    if _session_id not in modified_schema_store.keys():
+        modified_schema_store[_session_id] = ""
+    if len(schema['input_schema']['properties']) == len(values):
+        # 根据用户输入生成输出字典，结构与输入类似，并新增 'user_input'
+        output = {
+            'name': schema['name'],
+            'description': schema['description'],
+            'input_schema': {'properties': {}},
+            'parameters': schema.get('parameters', {})
+        }
+        for (key, prop), val in zip(schema['input_schema']['properties'].items(), values):
+            new_prop = prop.copy()
+            new_prop['user_input'] = val
+            output['input_schema']['properties'][key] = new_prop
+
+        modified_schema_store[_session_id] = output
+        modified_args_store[_session_id] = extract_arguments_from_schema(output)
+        pending_events[_session_id].set()
+    return modified_schema_store[_session_id]
+
+def handle_refresh(work_path: str, session_id):
+    session_dir = os.path.join(work_path, session_id)
+    os.makedirs(session_dir, exist_ok=True)
+    # 返回更新后的文件列表（绝对路径）
+    all_files = sorted([
+        os.path.join(session_dir, f) for f in os.listdir(session_dir)
+        if os.path.isfile(os.path.join(session_dir, f))
+    ])
+    return all_files
+
+def handle_upload(files, work_path: str, session_id):
+    session_dir = os.path.join(work_path, session_id)
+    os.makedirs(session_dir, exist_ok=True)
+    saved_files = []
+    if files is None:
+        # 无文件上传时，只返回当前文件列表
+        files = []
+    # 处理每个上传文件
+    for file_obj in files:
+        file_path = file_obj.name  # 上传后 Gradio 存储的临时文件路径
+        # 检查文件大小 (最大 10MB)
+        if os.path.getsize(file_path) > 10 * 1024 * 1024:
+            continue  # 跳过超限文件，可改为报错提示
+        filename = os.path.basename(file_path)
+        dest_path = os.path.join(session_dir, filename)
+        # 复制文件到会话目录（覆盖同名文件）
+        with open(file_path, "rb") as src, open(dest_path, "wb") as dst:
+            dst.write(src.read())
+        saved_files.append(dest_path)
+    # 返回更新后的文件列表（绝对路径）
+    all_files = sorted([
+        os.path.join(session_dir, f) for f in os.listdir(session_dir)
+        if os.path.isfile(os.path.join(session_dir, f))
+    ])
+    return all_files
+
+
+def update_interface(selected_value):
+    if selected_value == "玻尔(作为任务提交到Bohrium)":
+        return [
+            "Bohr",
+            gr.Textbox(visible=True),
+            gr.Textbox(visible=True),
+            gr.Textbox(visible=True)
+        ]
+    elif selected_value == "在线(在agent部署服务器运行)":
+        return [
+            "Local",
+            gr.Textbox(visible=False),
+            gr.Textbox(visible=False),
+            gr.Textbox(visible=False)
+        ]
+    else:
+        return [
+            "None",
+            gr.Textbox(visible=False),
+            gr.Textbox(visible=False),
+            gr.Textbox(visible=False)
+        ]
+
+
+def update_executor_storage_state(mode, username, password, project_id):
+    if mode == "在线(在agent部署服务器运行)":
+        return [
+            {
+                "type": "local"
+            },
+            {
+                "type": "https"
+            }
+        ]
+    elif mode == "玻尔(作为任务提交到Bohrium)":
+        return [
+            {
+                "type": "dispatcher",
+                "machine": {
+                    "batch_type": "Bohrium",
+                    "context_type": "Bohrium",
+                    "remote_profile": {
+                        "email": username,
+                        "password": password,
+                        "program_id": int(project_id),
+                        "input_data": {
+                            "image_name": "registry.dp.tech/dptech/dp/native/prod-19853/dpa-mcp:0.0.0",
+                            "job_type": "container",
+                            "platform": "ali",
+                            "scass_type": "1 * NVIDIA V100_32g"
+                        }
+                    }
+                }
+            },
+            {
+                "type": "bohrium",
+                "username": username,
+                "password": password,
+                "program_id": int(project_id),
+            }
+        ]
+
+
+def create_interface(mcp_server_url: str,
+                     agent_info: dict,
+                     work_path: str,
+                     tools_info: List[Dict[str, Any]],
+                     model_config: dict,
+                     mcp_server_mode: str):
     """创建Gradio界面"""
-    with gr.Blocks(title=agent_info["name"], theme=gr.themes.Soft()) as demo:
+    with (gr.Blocks(title=agent_info["name"], theme=gr.themes.Soft()) as demo):
         # 状态变量
         session_id_state = gr.State("")
-        mcp_tools_url_state = gr.State(mcp_tools_url)
+        mcp_server_url_state = gr.State(mcp_server_url)
         agent_info_state = gr.State(agent_info)
+        model_config_state = gr.State(model_config)
         work_path_state = gr.State(work_path)
+        tools_info_state = gr.State(tools_info)
+        finish_state = gr.State(True)
+        task_submit_mode_state = gr.State("None")
+        executor_state = gr.State()
+        storage_state = gr.State()
+        schema_state = gr.State()
 
         gr.Markdown(f"# {agent_info['name']}")
 
@@ -233,15 +465,91 @@ def create_interface(mcp_tools_url: str, agent_info: dict, work_path: str):
 
         with gr.Column(visible=False) as chat_section:
             with gr.Row():
-                with gr.Column(scale=2) as main_column:
+                with gr.Column(scale=1) as files_column:
+                    if mcp_server_mode == "bohr-agent-sdk":
+                        with gr.Row():
+                            gr.Markdown(
+                                f"**工具执行位置**")
+                            gr.HTML("""
+                                                            <div style="margin-left: 10px; margin-top: 0px;">
+                                                                <span title="在线模式：将会在agent部署的服务器上运行，所有数据将会在一小时后自动清除，且可能无法访问完整文件。
+                        玻尔模式：将会在你的Bohrium存储中运行，任务会被提交为Bohrium任务，可能会产生一定的开销，但数据不会保存在当前服务器上。
+                        某些任务不能在线运行（如需要大量算力或时间的任务）" style="cursor: help; font-size: 16px;">❓</span>
+                                                            </div>
+                                                            """)
+
+                        mode_choice = gr.Dropdown(
+                            choices=["请选择", "在线(在agent部署服务器运行)", "玻尔(作为任务提交到Bohrium)"],
+                            value="请选择",
+                            label="选择运行模式"
+                        )
+
+                        bohrium_username = gr.Textbox(visible=False, label="Bohrium用户名")
+                        bohrium_password = gr.Textbox(visible=False, label="Bohrium密码")
+                        bohrium_project_id = gr.Textbox(visible=False, label="Bohrium项目ID")
+
+                        mode_choice.change(
+                            fn=update_interface,
+                            inputs=mode_choice,
+                            outputs=[task_submit_mode_state, bohrium_username, bohrium_password, bohrium_project_id]
+                        ).then(
+                            fn=update_executor_storage_state,
+                            inputs=[mode_choice, bohrium_username, bohrium_password, bohrium_project_id],
+                            outputs=[executor_state, storage_state]
+                        )
+
+                        bohrium_username.change(
+                            fn=update_executor_storage_state,
+                            inputs=[mode_choice, bohrium_username, bohrium_password, bohrium_project_id],
+                            outputs=[executor_state, storage_state]
+                        )
+
+                        bohrium_password.change(
+                            fn=update_executor_storage_state,
+                            inputs=[mode_choice, bohrium_username, bohrium_password, bohrium_project_id],
+                            outputs=[executor_state, storage_state]
+                        )
+
+                        bohrium_project_id.change(
+                            fn=update_executor_storage_state,
+                            inputs=[mode_choice, bohrium_username, bohrium_password, bohrium_project_id],
+                            outputs=[executor_state, storage_state]
+                        )
+
+                    with gr.Row(equal_height=True):
+                        with gr.Column():
+                            file_list = gr.File(label="可下载文件列表", file_count="multiple")
+
+                            with gr.Row():
+                                refresh_btn = gr.Button("刷新目录")
+                                upload_btn = gr.UploadButton("上传文件", file_count="multiple", file_types=None)
+
+                                refresh_btn.click(
+                                    fn=handle_refresh,
+                                    inputs=[work_path_state, session_id_state],
+                                    outputs=[file_list]
+                                )
+
+                                upload_btn.upload(
+                                    fn=handle_upload,
+                                    inputs=[upload_btn, work_path_state, session_id_state],
+                                    outputs=[file_list]
+                                )
+
+                with gr.Column(scale=3) as main_column:
                     gr.Markdown(f"## 与{agent_info['name']}协作")
 
-                    # 显示当前用户和项目信息
-                    current_info = gr.Textbox(
-                        label="当前会话信息",
-                        interactive=False,
-                        value=""
-                    )
+                    with gr.Row(equal_height=True):
+                        with gr.Column():
+                            clear_btn = gr.Button("清空对话")
+                            logout_btn = gr.Button("离开会话", variant="secondary")
+                        # 显示当前用户和项目信息
+                        current_info = gr.Textbox(
+                            label="当前会话信息",
+                            interactive=False,
+                            value=""
+                        )
+                        chat_status = gr.Textbox(label="聊天状态", interactive=False)
 
                     chatbot = gr.Chatbot(
                         label="聊天记录",
@@ -249,25 +557,137 @@ def create_interface(mcp_tools_url: str, agent_info: dict, work_path: str):
                         show_copy_button=True
                     )
 
-                    with gr.Row(equal_height=True):
-                        msg = gr.Textbox(
-                            label="输入消息",
-                            placeholder=f"输入你想对{agent_info['name']}说的话...",
-                            scale=4
-                        )
-                        send_btn = gr.Button("发送", variant="primary", scale=1)
+                    @gr.render(inputs=finish_state)
+                    def render_input_box(finish):
+                        with gr.Row(equal_height=True):
+                            example = gr.Dropdown(
+                                choices=["-",
+                                         '请帮我生成碳的训练输入配置文件，基组为{"C":"2s1p"}，截断半径{"C":6.0}，训练数据路径"my_data"，前缀"C16"，其余按默认配置',
+                                         "使用poly4基准模型绘制能带图",
+                                         "请帮我生成sp轨道的Si的ploy4基准模型",
+                                         "请使用我的模型预测并绘制能带图"],
+                                value="-",
+                                label="输入对话示例"
+                            )
 
-                    with gr.Row():
-                        clear_btn = gr.Button("清空对话")
-                        logout_btn = gr.Button("离开会话", variant="secondary")
+                            msg = gr.Textbox(
+                                label="输入消息",
+                                placeholder=f"输入你想对{agent_info['name']}说的话...",
+                                scale=4
+                            )
+                            send_btn = gr.Button("发送", variant="primary", scale=1, interactive=finish)
 
-                    chat_status = gr.Textbox(label="聊天状态", interactive=False)
+                            send_btn.click(
+                                fn=handle_send_message,
+                                inputs=[msg, chatbot, session_id_state, tools_info_state],
+                                outputs=[chatbot, chat_status, schema_state, finish_state]
+                            ).then(
+                                lambda: "",  # 清空输入框
+                                outputs=msg
+                            )
+
+                            # 回车发送消息
+                            """msg.submit(
+                                fn=handle_send_message,
+                                inputs=[msg, chatbot, session_id_state, tools_info_state],
+                                outputs=[chatbot, chat_status, schema_state]
+                            ).then(
+                                lambda: "",  # 清空输入框
+                                outputs=msg
+                            )"""
+
+                            example.change(
+                                fn=lambda m:m,
+                                inputs=example,
+                                outputs=[msg]
+                            )
 
                 with gr.Column(scale=1) as values_column:
                     gr.Markdown("## 修改运行参数")
                     gr.Markdown("当调用mcp工具时，将会弹出参数的确认或手动修改")
-                    with gr.Blocks() as values_block:
-                        pass
+
+                    @gr.render(inputs=[schema_state, session_id_state, task_submit_mode_state])
+                    def render_form(schema, _session_id, task_submit_mode):
+                        gr.Markdown("### 使用的运行参数：")
+
+                        if schema:
+                            output_json = gr.JSON(value=schema)
+
+                            submit_json_button = gr.Button("通过JSON快速提交")
+                            input_json = gr.Textbox(label="通过JSON快速提交")
+
+                            submit_json_button.click(lambda json_input: json.loads(json_input), inputs=input_json,
+                                                     outputs=output_json)
+
+                            submit_normal_button = gr.Button("修改各个参数提交")
+
+                        if not schema:
+                            gr.Markdown("**当调用工具时，此处会显示工具的各种函数。**")
+                            return
+                        # 显示 name 和 description
+                        gr.Markdown(f"## {schema['name']}")
+                        gr.Markdown(f"{schema['description']}")
+
+                        inputs = []
+                        # 为每个参数生成输入区域
+                        for key, prop in schema['input_schema']['properties'].items():
+                            title = prop.get('title', key)
+                            dtype = prop.get('type', None)
+                            agent_val = prop.get('agent_input', "")
+                            default_val = prop.get('default', "")
+                            # 对于bohr-agent-sdk产生的executor和storage类型：
+                            if title == 'Executor':
+                                inp = executor_state
+
+                            elif title == 'Storage':
+                                inp = storage_state
+
+                            elif title == 'Work Path' and task_submit_mode == "Local":
+                                inp = gr.State("/tmp/" + _session_id)
+
+                            else:
+                                # 显示参数信息
+                                gr.Markdown(
+                                    f"**{title}** (type: {dtype}) — 默认: `{default_val}`, Agent 尝试值: `{agent_val}`")
+                                # 根据类型选择组件
+                                if dtype == 'string':
+                                    inp = gr.Textbox(
+                                        value=agent_val if agent_val is not None else str(default_val),
+                                        label=title, key=key
+                                    )
+                                elif dtype in ('number', 'integer', 'float'):
+                                    # 处理数字类型，默认值转换为 float
+                                    num_val = agent_val if agent_val is not None else default_val
+                                    try:
+                                        num_val = float(num_val)
+                                    except:
+                                        num_val = 0.0
+                                    precision = 0 if dtype == 'integer' else None
+                                    inp = gr.Number(
+                                        value=num_val, precision=precision,
+                                        label=title, key=key
+                                    )
+                                elif dtype in 'bool':
+                                    inp = gr.Dropdown(
+                                        choices=["False", "True"],
+                                        value=agent_val if agent_val is not None else str(default_val),
+                                        label=title,
+                                        key=key
+                                    )
+                                else:
+                                    # 其它类型（如对象）使用 JSON 输入
+                                    default_json = agent_val if isinstance(agent_val, (dict, list)) else (
+                                        default_val if isinstance(default_val, (dict, list)) else {})
+                                    inp = gr.JSON(
+                                        value=default_json, label=title, key=key
+                                    )
+                            inputs.append(inp)
+
+                            # 提交按钮收集所有输入并生成输出
+                            submit_normal_button.click(lambda _session_id, *vals: collect_inputs(schema, _session_id, *vals),
+                                                       inputs=[session_id_state, *inputs],
+                                                       outputs=output_json
+                            )
 
         def on_generate_click():
             """当生成按钮被点击时的回调函数"""
@@ -286,7 +706,7 @@ def create_interface(mcp_tools_url: str, agent_info: dict, work_path: str):
         # 登录按钮事件
         login_btn.click(
             fn=login,
-            inputs=[session_id, mcp_tools_url_state, agent_info_state, work_path_state],
+            inputs=[session_id, mcp_server_url_state, agent_info_state, work_path_state, model_config_state],
             outputs=[login_section, chat_section, status_msg, chatbot]
         ).then(
             lambda _session_id:
@@ -297,30 +717,18 @@ def create_interface(mcp_tools_url: str, agent_info: dict, work_path: str):
         )
 
         # 发送消息事件
-        async def handle_send_message(message, history, _session_id):
+        async def handle_send_message(message, history, _session_id, _tools_info):
             if not message.strip():
-                yield history, "消息不能为空"
-            async for new_history, status in chat_with_agent(message, history, session_id=_session_id, agent_info=agent_info, work_path=work_path):
-                yield new_history, status
+                yield history, "消息不能为空", {}, True
+            else:
+                async for new_history, status, schema, finish in chat_with_agent(message,
+                                                                                 history,
+                                                                                 session_id=_session_id,
+                                                                                 agent_info=agent_info,
+                                                                                 work_path=work_path,
+                                                                                 tools_info=tools_info):
+                    yield new_history, status, schema, finish
 
-        send_btn.click(
-            fn=handle_send_message,
-            inputs=[msg, chatbot, session_id_state],
-            outputs=[chatbot, chat_status]
-        ).then(
-            lambda: "",  # 清空输入框
-            outputs=msg
-        )
-
-        # 回车发送消息
-        msg.submit(
-            fn=handle_send_message,
-            inputs=[msg, chatbot, session_id_state],
-            outputs=[chatbot, chat_status]
-        ).then(
-            lambda: "",  # 清空输入框
-            outputs=msg
-        )
 
         # 清空对话
         clear_btn.click(

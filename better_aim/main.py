@@ -1,10 +1,15 @@
 from google.adk.agents import LlmAgent
+from litellm.experimental_mcp_client import load_mcp_tools
+
 from better_aim.host import create_interface
 import os
 import argparse
 import sys
 from typing import Dict
 from dotenv import load_dotenv
+import asyncio
+
+from better_aim.load_mcp_tools import get_mcp_server_tools
 
 
 def parse_arguments():
@@ -53,21 +58,36 @@ def parse_arguments():
     return parser.parse_args()
 
 def launch(agent_info: dict,
+           model_config: dict,
            host: str="0.0.0.0",
            port: int=50005,
            share_mode: bool=False,
            debug_mode: bool=False,
-           mcp_tools_url: str="http://0.0.0.0:50001/sse",
+           mcp_server_url: str="http://0.0.0.0:50001/sse",
+           mcp_server_mode: str="bohr-agent-sdk",
            api_key: str=None,
            work_path: str='/tmp'):
     # 设置API密钥（命令行参数优先）
     if api_key:
-        os.environ["GOOGLE_API_KEY"] = api_key
-    elif not os.getenv("GOOGLE_API_KEY"):
-        print("警告: GOOGLE_API_KEY环境变量未设置，请通过--api-key参数设置或设置环境变量")
+        os.environ["API_KEY"] = api_key
+        model_config["api_key"] = api_key
+    else:
+        if os.getenv("API_KEY"):
+            model_config["api_key"] = os.getenv("API_KEY")
+        else:
+            print("警告: API_KEY环境变量未设置，请通过--api-key参数设置或设置环境变量")
+
+    # 加载 mcp server 工具信息
+    tools_info = asyncio.run(get_mcp_server_tools(mcp_server_url))
+    #print(tools_info)
 
     # 创建并启动界面
-    demo = create_interface(mcp_tools_url=mcp_tools_url, agent_info=agent_info, work_path=work_path)
+    demo = create_interface(mcp_server_url=mcp_server_url,
+                            agent_info=agent_info,
+                            work_path=work_path,
+                            tools_info=tools_info,
+                            model_config=model_config,
+                            mcp_server_mode=mcp_server_mode)
     os.chdir(work_path)
 
     print(f"启动参数: 主机={host}, 端口={port}, 分享={share_mode}, 调试={debug_mode}, 工作路径={work_path}")

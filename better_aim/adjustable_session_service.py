@@ -18,7 +18,7 @@ class AdjustableInMemorySessionService(InMemorySessionService):
         session.last_update_time = second_to_last_event.timestamp
         last_event = session.events.pop()
 
-        storage_session = self.sessions[session.app_name][session.user_id].get(session.session_id)
+        storage_session = self.sessions[session.app_name][session.user_id].get(session.id)
         storage_session.events.pop()
         storage_session.last_update_time = second_to_last_event.timestamp
         return last_event
@@ -26,11 +26,12 @@ class AdjustableInMemorySessionService(InMemorySessionService):
 async def pop_event(session_service: Union[InMemorySessionService, DatabaseSessionService], session: Session) -> Event:
     async def from_in_memory(_session_service: InMemorySessionService, _session: Session) -> Event:
         second_to_last_event = get_event(_session, -2)
-        _session_service.__update_session_state(_session, second_to_last_event)
+        update_method = getattr(_session_service, '_BaseSessionService__update_session_state')
+        update_method(_session, second_to_last_event)
         _session.last_update_time = second_to_last_event.timestamp
         last_event = _session.events.pop()
 
-        storage_session = _session_service.sessions[_session.app_name][_session.user_id].get(_session.session_id)
+        storage_session = _session_service.sessions[_session.app_name][_session.user_id].get(_session.id)
         storage_session.events.pop()
         storage_session.last_update_time = second_to_last_event.timestamp
         return last_event
@@ -39,3 +40,4 @@ async def pop_event(session_service: Union[InMemorySessionService, DatabaseSessi
         return await from_in_memory(session_service, session)
     elif isinstance(session_service, DatabaseSessionService):
         raise "not yet support DatabaseSessionService."
+    raise "session_service not yet support。"
