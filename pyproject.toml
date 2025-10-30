@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=45", "setuptools_scm>=6.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "better_aim"
+dynamic = ["version"]
+description = "better_aim"
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic",
+    "pydantic-ai[mcp]",
+    "gradio",
+    "mcp>=1.9.0"
+]
+
+[project.scripts]
+baim = "better_aim.main:main"
+
+[tool.setuptools]
+package-dir = { "better_aim" = "better_aim" }
+
+[tool.setuptools_scm]
+
+[tool.setuptools.packages.find]
+where = [""]
+include = ["better_aim*"]
+exclude = ["tests*", "docs*", "examples*"]
+
+[tool.pytest.ini_options]
+pythonpath = [""]
+testpaths = ["tests"]
+addopts = "-v"
