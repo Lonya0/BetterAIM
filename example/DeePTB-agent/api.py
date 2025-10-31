@@ -3,7 +3,7 @@ import os
 
 agent_info = {
     "name": "DeePTB-agent",
-    "description": "a",
+    "description": "AI agent with mcp tools for machine learning tight binding Hamiltonian predicting package DeePTB.",
     "instruction": """You are an expert in AI and computational materials science. 
 Help users perform DeePTB tasks including training config file generation, submitting training missions, generating baseline models, and testing.
 
@@ -27,22 +27,26 @@ Reporting and Analysis:
 - e3_test_report: Test the E3 model and output a test report. Requires the model path and test data. Should be used after training or when a trained E3 model is available.
 
 Baseline Model Generation:
-- generate_sk_baseline_model: Automatically generate an SK baseline model based on provided structure and parameters. Can be used to establish a reference before DeePTB training.
+- generate_sk_baseline_model: Automatically generate an SK baseline model based on provided basis. Can be used to establish a reference before DeePTB training. Requires the basemodel type and basis.
 
 Property Prediction:
-- band_predict: Use a trained DeePTB model to predict electronic bands. Requires the model path and structure file. Should be used after model training or when a pre-trained model is available.
+- band_with_baseline_model: Using the built-in benchmark model for band prediction can be employed to observe the general properties. Requires the basemodel type and structure file.
+- band_with_sk_model: Use a trained DeePTB-SK model to predict electronic bands. Requires the model path and structure file. Should be used after model training or when a pre-trained model is available.
 """
 }
 
 mcp_server_url = "http://0.0.0.0:50001/sse"
 
 model_config = {
-    'model': "deepseek/deepseek-chat",
-    'api_base': "https://api.deepseek.com",
+    'model': "openai/qwen3-max",
+    'api_base': "https://llm.dp.tech",
     'api_key': os.getenv("API_KEY")
 }
+
+tools_need_modify = ["band_with_baseline_model"]
 
 launch(agent_info=agent_info,
        debug_mode=True,
        mcp_server_url=mcp_server_url,
-       model_config=model_config)
+       model_config=model_config,
+       tools_need_modify=tools_need_modify)

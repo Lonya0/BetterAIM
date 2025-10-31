@@ -1,3 +1,5 @@
+import time
+
 import gradio as gr
 import json
 import os
@@ -9,18 +11,9 @@ from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
 import asyncio
+from better_aim.tool_modify_guardrail import collect_inputs
 
-from better_aim.utils import generate_random_string
-
-session_service = InMemorySessionService()
-
-# 全局变量存储活跃的agents
-active_agents: Dict[str, LlmAgent] = {}
-
-# 全局事件池，用于控制暂停与恢复
-pending_events = {}  # session_id -> asyncio.Event
-modified_args_store = {}  # 临时存储修改后的参数
-modified_schema_store = {}  # 临时存储修改后的参数
+from better_aim.utils import generate_random_string, hash_dict
 
 
 def get_chat_history_file_path(sha_id: str, work_path: str) -> str:
@@ -67,13 +60,14 @@ def login(session_id: str,
 
     if not session_id:
         return gr.update(visible=True), gr.update(visible=False), "请填写或自动生成会话ID", []
-    elif len(session_id) != 20:
-        return gr.update(visible=True), gr.update(visible=False), f"会话ID需要为长度为20的任意字符，目前长度：{len(session_id)}", []
+    elif len(session_id) != 32:
+        return gr.update(visible=True), gr.update(visible=False), f"会话ID需要为长度为32的任意字符，目前长度：{len(session_id)}", []
 
     # 生成SHA ID
     sha_id = session_id
 
     # 创建或获取agent
+    from better_aim.main import active_agents
     if sha_id not in active_agents:
         try:
             agent = create_llm_agent(session_id=session_id,
@@ -97,80 +91,6 @@ def login(session_id: str,
         chat_history  # 聊天历史
     )
 
-def zip_tool_schema(tool_name, arguments, tools_dict):
-    """
-    根据工具名称和参数准备工具模式
-
-    Args:
-        tool_name: 工具名称
-        arguments: 参数字典
-        tools_dict: 工具字典列表
-
-    Returns:
-        包含agent_input的更新后的工具模式字典，如果未找到工具则返回None
-    """
-    # 在工具字典中查找匹配的工具
-    tool_info = None
-    for tool in tools_dict:
-        if tool.get('name') == tool_name:
-            tool_info = tool.copy()  # 创建副本以避免修改原始数据
-            break
-
-    if tool_info is None:
-        return None
-
-    # 如果有input_schema且包含properties，则插入agent_input字段
-    if 'input_schema' in tool_info and 'properties' in tool_info['input_schema']:
-        properties = tool_info['input_schema']['properties']
-
-        for prop_name, prop_value in properties.items():
-            if prop_name in arguments:
-                # 在属性字典中插入agent_input，保持原有结构
-                prop_value = prop_value.copy()  # 创建属性副本
-                prop_value['agent_input'] = arguments[prop_name]
-                properties[prop_name] = prop_value
-
-    return tool_info
-
-def extract_arguments_from_schema(tool_schema):
-    """
-    从工具模式中提取user_input并生成arguments字典
-
-    Args:
-        tool_schema: 包含input_schema的工具模式字典
-
-    Returns:
-        包含所有user_input值的参数字典
-    """
-    try:
-        arguments = {}
-
-        # 检查输入有效性
-        if not tool_schema or not isinstance(tool_schema, dict):
-            return arguments
-
-        if 'input_schema' not in tool_schema or not isinstance(tool_schema['input_schema'], dict):
-            return arguments
-
-        input_schema = tool_schema['input_schema']
-
-        if 'properties' not in input_schema or not isinstance(input_schema['properties'], dict):
-            return arguments
-
-        properties = input_schema['properties']
-
-        # 遍历所有属性，提取user_input
-        for prop_name, prop_value in properties.items():
-            if (isinstance(prop_value, dict) and
-                    'user_input' in prop_value):
-                arguments[prop_name] = prop_value['user_input']
-
-        return arguments
-
-    except Exception as e:
-        print(f"提取参数时发生错误: {e}")
-        return {}
-
 # modified from https://google.github.io/adk-docs/tutorials/agent-team/#step-1-your-first-agent-basic-weather-lookup
 async def call_agent_async(query: str, runner, user_id, session_id, tools_info: List[Dict[str, Any]]):
     """Sends a query to the agent and prints the final response."""
@@ -186,7 +106,7 @@ async def call_agent_async(query: str, runner, user_id, session_id, tools_info: 
     async for event in runner.run_async(user_id=user_id, session_id=session_id, new_message=content):
         # You can uncomment the line below to see *all* events during execution
         #print(f"  [Event] Author: {event.author}, Type: {type(event).__name__}, Final: {event.is_final_response()}, Content: {event.content}, a:{event.content.parts}")
-
+        """
         # 检测 function call
         # https://google.github.io/adk-docs/events/#identifying-event-origin-and-type
         if event.content and event.content.parts:
@@ -229,7 +149,7 @@ async def call_agent_async(query: str, runner, user_id, session_id, tools_info: 
                                                    user_id=user_id,
                                                    session_id=session_id)
         print(f"----------------------{session}")
-
+        """
         # Key Concept: is_final_response() marks the concluding message for the turn.
         if event.is_final_response():
             if event.content and event.content.parts:
@@ -254,10 +174,12 @@ async def chat_with_agent(message: str,
                           tools_info: List[Dict[str, Any]]) -> \
 AsyncGenerator[tuple[list[list[str]], str, Dict, bool], Any]:
     """处理与agent的聊天"""
+    from better_aim.main import active_agents
     if session_id not in active_agents:
         yield history, "Agent未找到，请重新登录", {}, True
 
     agent = active_agents[session_id]
+    from better_aim.main import session_service
     session = await session_service.create_session(app_name=agent_info["name"],
                                    user_id=session_id[:4],
                                    session_id=session_id)
@@ -304,28 +226,6 @@ def logout() -> Tuple[gr.update, gr.update, str, List[List[str]], str]:
         [],  # 清空聊天历史
         ""# 清空登录表单
     )
-
-def collect_inputs(schema, _session_id, *values):
-    print(f"aaaaaaaaaaaaaa{len(schema['input_schema']['properties'])},bbbbbbbbbbbbbb{len(values)}")
-    if _session_id not in modified_schema_store.keys():
-        modified_schema_store[_session_id] = ""
-    if len(schema['input_schema']['properties']) == len(values):
-        # 根据用户输入生成输出字典，结构与输入类似，并新增 'user_input'
-        output = {
-            'name': schema['name'],
-            'description': schema['description'],
-            'input_schema': {'properties': {}},
-            'parameters': schema.get('parameters', {})
-        }
-        for (key, prop), val in zip(schema['input_schema']['properties'].items(), values):
-            new_prop = prop.copy()
-            new_prop['user_input'] = val
-            output['input_schema']['properties'][key] = new_prop
-
-        modified_schema_store[_session_id] = output
-        modified_args_store[_session_id] = extract_arguments_from_schema(output)
-        pending_events[_session_id].set()
-    return modified_schema_store[_session_id]
 
 def handle_refresh(work_path: str, session_id):
     session_dir = os.path.join(work_path, session_id)
@@ -447,6 +347,7 @@ def create_interface(mcp_server_url: str,
         executor_state = gr.State()
         storage_state = gr.State()
         schema_state = gr.State()
+        schema_hash_store_state = gr.State({})
 
         gr.Markdown(f"# {agent_info['name']}")
 
@@ -454,10 +355,10 @@ def create_interface(mcp_server_url: str,
             gr.Markdown("## 创建会话")
 
             with gr.Row(equal_height=True):
-                session_id = gr.Textbox(label="会话ID", placeholder="请输入20位任意字符串", scale=4)
+                session_id = gr.Textbox(label="会话ID", placeholder="请输入32位任意字符串", scale=4)
                 generate_btn = gr.Button("随机生成", scale=1, min_width=100, variant="primary")
 
-            gr.Markdown("输入或自动生成20位任意字符串作为您的专属会话ID，使用相同ID可以访问此前的历史记录，历史记录在一小时后会被自动清除，请不要传播您专属的ID！")
+            gr.Markdown("输入或自动生成32位任意字符串作为您的专属会话ID，使用相同ID可以访问此前的历史记录，历史记录在一小时后会被自动清除，请不要传播您专属的ID！")
 
             login_btn = gr.Button("进入会话", variant="primary")
 
@@ -473,8 +374,8 @@ def create_interface(mcp_server_url: str,
                             gr.HTML("""
                                                             <div style="margin-left: 10px; margin-top: 0px;">
                                                                 <span title="在线模式：将会在agent部署的服务器上运行，所有数据将会在一小时后自动清除，且可能无法访问完整文件。
-                        玻尔模式：将会在你的Bohrium存储中运行，任务会被提交为Bohrium任务，可能会产生一定的开销，但数据不会保存在当前服务器上。
-                        某些任务不能在线运行（如需要大量算力或时间的任务）" style="cursor: help; font-size: 16px;">❓</span>
+玻尔模式：将会在你的Bohrium存储中运行，任务会被提交为Bohrium任务，可能会产生一定的开销，但数据不会保存在当前服务器上。
+某些任务不能在线运行（如需要大量算力或时间的任务）将会自动提交为Bohrium任务。" style="cursor: help; font-size: 16px;">❓</span>
                                                             </div>
                                                             """)
 
@@ -606,8 +507,28 @@ def create_interface(mcp_server_url: str,
                     gr.Markdown("## 修改运行参数")
                     gr.Markdown("当调用mcp工具时，将会弹出参数的确认或手动修改")
 
+                    # 尝试更新
+                    def check_update_schema(_session_id, hash_store):
+                        print("Checking update...")
+                        from better_aim.main import unmodified_schema_store
+                        if _session_id not in unmodified_schema_store.keys():
+                            return {_: ""}
+                        new_hash = hash_dict(unmodified_schema_store[_session_id])
+                        if _session_id not in hash_store.keys() or new_hash != hash_store[_session_id]:
+                            hash_store[_session_id] = new_hash
+                            return {schema_state: unmodified_schema_store[_session_id]}
+                        return {_: ""}  # 无变化时跳过更新
+
+                    _ = gr.State()
+
+                    timer = gr.Timer(1)
+                    timer.tick(fn=check_update_schema,
+                               inputs=[session_id_state, schema_hash_store_state],
+                               outputs=[schema_state, _])
+
                     @gr.render(inputs=[schema_state, session_id_state, task_submit_mode_state])
                     def render_form(schema, _session_id, task_submit_mode):
+                        print("Updating...")
                         gr.Markdown("### 使用的运行参数：")
 
                         if schema:

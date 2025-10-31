@@ -1,4 +1,5 @@
 from google.adk.agents import LlmAgent
+from google.adk.sessions import InMemorySessionService
 from litellm.experimental_mcp_client import load_mcp_tools
 
 from better_aim.host import create_interface
@@ -11,6 +12,19 @@ import asyncio
 
 from better_aim.load_mcp_tools import get_mcp_server_tools
 
+# 存储需要进行变量检查的工具
+target_tools = []
+tools_info = {}
+session_service = InMemorySessionService()
+
+# 全局变量存储活跃的agents
+active_agents: Dict[str, LlmAgent] = {}
+
+# 全局事件池，用于控制暂停与恢复
+pending_events = {}  # session_id -> asyncio.Event
+unmodified_schema_store = {}  # 临时存储未修改前的参数
+modified_schema_store = {}  # 临时存储修改后的参数
+modified_args_store = {}  # 临时存储修改后的参数
 
 def parse_arguments():
     """解析命令行参数"""
@@ -66,8 +80,10 @@ def launch(agent_info: dict,
            mcp_server_url: str="http://0.0.0.0:50001/sse",
            mcp_server_mode: str="bohr-agent-sdk",
            api_key: str=None,
-           work_path: str='/tmp'):
+           work_path: str='/tmp',
+           tools_need_modify=None):
     # 设置API密钥（命令行参数优先）
+    global target_tools, tools_info
     if api_key:
         os.environ["API_KEY"] = api_key
         model_config["api_key"] = api_key
@@ -76,6 +92,9 @@ def launch(agent_info: dict,
             model_config["api_key"] = os.getenv("API_KEY")
         else:
             print("警告: API_KEY环境变量未设置，请通过--api-key参数设置或设置环境变量")
+
+    if tools_need_modify:
+        target_tools = tools_need_modify
 
     # 加载 mcp server 工具信息
     tools_info = asyncio.run(get_mcp_server_tools(mcp_server_url))
