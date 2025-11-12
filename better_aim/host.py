@@ -419,7 +419,7 @@ def create_interface(mcp_server_url: str,
 
                     with gr.Row(equal_height=True):
                         with gr.Column():
-                            file_list = gr.File(label="可下载文件列表", file_count="multiple")
+                            file_list = gr.File(label="您的专属工作区（在线模式）", file_count="multiple")
 
                             with gr.Row():
                                 refresh_btn = gr.Button("刷新目录")
@@ -441,16 +441,12 @@ def create_interface(mcp_server_url: str,
                     gr.Markdown(f"## 与{agent_info['name']}协作")
 
                     with gr.Row(equal_height=True):
-                        with gr.Column():
+                        with gr.Column(scale=1):
                             clear_btn = gr.Button("清空对话")
                             logout_btn = gr.Button("离开会话", variant="secondary")
                         # 显示当前用户和项目信息
-                        current_info = gr.Textbox(
-                            label="当前会话信息",
-                            interactive=False,
-                            value=""
-                        )
-                        chat_status = gr.Textbox(label="聊天状态", interactive=False)
+                        current_info = gr.Textbox(label="当前会话信息", interactive=False, value="", scale=2)
+                        chat_status = gr.Textbox(label="聊天状态", interactive=False, scale=2)
 
                     chatbot = gr.Chatbot(
                         label="聊天记录",
@@ -464,7 +460,7 @@ def create_interface(mcp_server_url: str,
                             example = gr.Dropdown(
                                 choices=["-",
                                          '请帮我生成碳的训练输入配置文件，基组为{"C":"2s1p"}，截断半径{"C":6.0}，训练数据路径"my_data"，前缀"C16"，其余按默认配置',
-                                         "使用poly4基准模型绘制能带图",
+                                         "使用poly4基准模型绘制能带图，结构文件为xxx",
                                          "请帮我生成sp轨道的Si的ploy4基准模型",
                                          "请使用我的模型预测并绘制能带图"],
                                 value="-",
@@ -535,7 +531,7 @@ def create_interface(mcp_server_url: str,
                             output_json = gr.JSON(value=schema)
 
                             submit_json_button = gr.Button("通过JSON快速提交")
-                            input_json = gr.Textbox(label="通过JSON快速提交")
+                            input_json = gr.Textbox(label="请输入JSON")
 
                             submit_json_button.click(lambda json_input: json.loads(json_input), inputs=input_json,
                                                      outputs=output_json)

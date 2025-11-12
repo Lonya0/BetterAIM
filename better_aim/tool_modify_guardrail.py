@@ -31,7 +31,8 @@ async def tool_modify_guardrail(
         print("--- Callback: The user has clicked the button and continues to execute. ---")
 
         unmodified_schema_store[session_id] = ""
-        args = modified_args_store[session_id]
+        for k, v in modified_args_store[session_id].items():
+            args[k] = v
 
         print(f"--- Callback: Tool '{tool_name}' Running with modified args: {args}. ---")
     else:
