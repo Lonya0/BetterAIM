@@ -20,6 +20,9 @@ session_service = InMemorySessionService()
 # 全局变量存储活跃的agents
 active_agents: Dict[str, LlmAgent] = {}
 
+# 全局存储历史记录
+history_pool = {}
+
 # 全局事件池，用于控制暂停与恢复
 pending_events = {}  # session_id -> asyncio.Event
 unmodified_schema_store = {}  # 临时存储未修改前的参数

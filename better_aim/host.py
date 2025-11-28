@@ -1,9 +1,13 @@
 import time
+import functools
 
 import gradio as gr
 import json
 import os
 from typing import Dict, List, Tuple, Any, AsyncGenerator
+
+from gradio.components.chatbot import ExampleMessage
+
 from better_aim.agent import create_llm_agent
 from better_aim.adjustable_session_service import pop_event
 from google.adk.agents import LlmAgent
@@ -11,6 +15,7 @@ from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
 import asyncio
+
 from better_aim.tool_modify_guardrail import collect_inputs
 
 from better_aim.utils import generate_random_string, hash_dict
@@ -53,7 +58,7 @@ def login(session_id: str,
           agent_info: dict,
           work_path: str,
           model_config: dict) -> Tuple[
-    gr.update, gr.update, str, List[List[str]]]:
+    gr.update, gr.update, str]:
     """处理登录逻辑"""
 
     print(work_path)
@@ -87,8 +92,7 @@ def login(session_id: str,
     return (
         gr.update(visible=False),  # 隐藏登录界面
         gr.update(visible=True),  # 显示聊天界面
-        f"登录成功! 会话 ID: {'*' * 16 + sha_id[:4]}",  # 状态消息
-        chat_history  # 聊天历史
+        f"登录成功! 会话 ID: {'*' * 16 + sha_id[:4]}"  # 状态消息
     )
 
 # modified from https://google.github.io/adk-docs/tutorials/agent-team/#step-1-your-first-agent-basic-weather-lookup
@@ -154,14 +158,14 @@ async def call_agent_async(query: str, runner, user_id, session_id, tools_info: 
         if event.is_final_response():
             if event.content and event.content.parts:
                 # Assuming text response in the first part
-                yield event.content.parts[0].text, {}, True
+                yield event.content.parts[0].text, True
             elif event.actions and event.actions.escalate: # Handle potential errors/escalations
-                yield f"Agent escalated: {event.error_message or 'No specific message.'}", {}, True
+                yield f"Agent escalated: {event.error_message or 'No specific message.'}", True
             # Add more checks here if needed (e.g., specific error codes)
             break # Stop processing events once the final response is found
         else:
             if event.content and event.content.parts:
-                yield event.content.parts[0].text, {}, False
+                yield event.content.parts[0].text, False
 
     #print(f"<<< Agent Response: {final_response_text}")
 
@@ -172,11 +176,12 @@ async def chat_with_agent(message: str,
                           agent_info: dict,
                           work_path: str,
                           tools_info: List[Dict[str, Any]]) -> \
-AsyncGenerator[tuple[list[list[str]], str, Dict, bool], Any]:
+AsyncGenerator[tuple[list[list[str]], str, bool], Any]:
     """处理与agent的聊天"""
     from better_aim.main import active_agents
     if session_id not in active_agents:
-        yield history, "Agent未找到，请重新登录", {}, True
+        yield history, "Agent未找到，请重新登录", True
+        return
 
     agent = active_agents[session_id]
     from better_aim.main import session_service
@@ -189,8 +194,9 @@ AsyncGenerator[tuple[list[list[str]], str, Dict, bool], Any]:
                     session_service=session_service)
 
     responses = []
+    last_yielded_history = None
 
-    async for response, schema, is_final in call_agent_async(query=message,
+    async for response, is_final in call_agent_async(query=message,
                                                              runner=runner,
                                                              user_id=session_id[:4],
                                                              session_id=session_id,
@@ -208,22 +214,21 @@ AsyncGenerator[tuple[list[list[str]], str, Dict, bool], Any]:
         # 保存聊天历史
         save_chat_history(session_id, new_history, work_path)
 
-        if schema == {}:
+        # 只有当历史记录发生变化时才yield，避免重复发送相同数据
+        if new_history != last_yielded_history:
+            last_yielded_history = new_history
             if is_final:
-                yield new_history, "待机中。", schema, True
+                yield new_history, "待机中。", True
             else:
-                yield new_history, "正在等待LLM回复……", schema, False
-        else:
-            yield new_history, "正在等待用户调整输入变量……", schema, False
+                yield new_history, "正在等待LLM回复……", False
 
 
-def logout() -> Tuple[gr.update, gr.update, str, List[List[str]], str]:
+def logout() -> Tuple[gr.update, gr.update, str, str]:
     """处理登出逻辑"""
     return (
         gr.update(visible=True),  # 显示登录界面
         gr.update(visible=False),  # 隐藏聊天界面
         "已登出",  # 状态消息
-        [],  # 清空聊天历史
         ""# 清空登录表单
     )
 
@@ -327,12 +332,41 @@ def update_executor_storage_state(mode, username, password, project_id):
         ]
 
 
+
+
 def create_interface(mcp_server_url: str,
                      agent_info: dict,
                      work_path: str,
                      tools_info: List[Dict[str, Any]],
                      model_config: dict,
                      mcp_server_mode: str):
+    # 发送消息事件
+    async def handle_send_message(message, _session_id, _tools_info):
+        from better_aim.main import history_pool
+        history = history_pool[_session_id]
+        if not message.strip():
+            yield history, "消息不能为空", {}, True
+        else:
+            # 使用一个累积变量来存储所有响应
+            accumulated_history = history.copy() if history else []
+
+            async for new_history, status, finish in chat_with_agent(message,
+                                                                     history,
+                                                                     session_id=_session_id,
+                                                                     agent_info=agent_info,
+                                                                     work_path=work_path,
+                                                                     tools_info=tools_info):
+                # 更新累积的历史记录
+                if new_history and len(new_history) > 0:
+                    accumulated_history.append(new_history)
+
+                print(accumulated_history)
+
+                history_pool[_session_id] = accumulated_history
+
+                # 每次都yield最新的状态，确保Gradio能接收到所有更新
+                yield status, finish
+
     """创建Gradio界面"""
     with (gr.Blocks(title=agent_info["name"], theme=gr.themes.Soft()) as demo):
         # 状态变量
@@ -355,14 +389,14 @@ def create_interface(mcp_server_url: str,
             gr.Markdown("## 创建会话")
 
             with gr.Row(equal_height=True):
-                session_id = gr.Textbox(label="会话ID", placeholder="请输入32位任意字符串", scale=4)
+                session_id = gr.Textbox(label="会话ID", placeholder="请输入32位任意字符串", value="", scale=4)
                 generate_btn = gr.Button("随机生成", scale=1, min_width=100, variant="primary")
 
             gr.Markdown("输入或自动生成32位任意字符串作为您的专属会话ID，使用相同ID可以访问此前的历史记录，历史记录在一小时后会被自动清除，请不要传播您专属的ID！")
 
             login_btn = gr.Button("进入会话", variant="primary")
 
-            status_msg = gr.Textbox(label="状态", interactive=False)
+            status_msg = gr.Textbox(label="状态", interactive=False, value="")
 
         with gr.Column(visible=False) as chat_section:
             with gr.Row():
@@ -448,56 +482,77 @@ def create_interface(mcp_server_url: str,
                         current_info = gr.Textbox(label="当前会话信息", interactive=False, value="", scale=2)
                         chat_status = gr.Textbox(label="聊天状态", interactive=False, scale=2)
 
-                    chatbot = gr.Chatbot(
-                        label="聊天记录",
-                        height=900,
-                        show_copy_button=True
-                    )
+                    from better_aim.main import history_pool
 
-                    @gr.render(inputs=finish_state)
-                    def render_input_box(finish):
-                        with gr.Row(equal_height=True):
-                            example = gr.Dropdown(
-                                choices=["-",
-                                         '请帮我生成碳的训练输入配置文件，基组为{"C":"2s1p"}，截断半径{"C":6.0}，训练数据路径"my_data"，前缀"C16"，其余按默认配置',
-                                         "使用poly4基准模型绘制能带图，结构文件为xxx",
-                                         "请帮我生成sp轨道的Si的ploy4基准模型",
-                                         "请使用我的模型预测并绘制能带图"],
-                                value="-",
-                                label="输入对话示例"
+                    @gr.render(inputs=session_id_state)
+                    def render_chatbot(_session_id):
+                        if _session_id:
+                            if not history_pool[session_id]:
+                                history_pool[session_id] = {"role": "assistant",
+                                                            "content": "I am happy to provide you that report and plot."}
+                            chatbot = gr.Chatbot(
+                                value=history_pool[session_id],
+                                label="聊天记录",
+                                height=700,
+                                show_copy_button=True,
+                                examples=[
+                                    {"text":'请帮我生成碳的训练输入配置文件，基组为{"C":"2s1p"}，截断半径{"C":6.0}，训练数据路径"my_data"，前缀"C16"，其余按默认配置',
+                                     "display_text":"生成训练输入配置文件"},
+                                    {"text":"使用poly4基准模型绘制能带图，结构文件为xxx",
+                                     "display_text":"使用基准模型绘制能带图"},
+                                    {"text":"请帮我生成sp轨道的Si的ploy4基准模型",
+                                     "display_text":"生成基准模型"},
+                                    {"text":"请使用我的模型预测并绘制能带图",
+                                     "display_text":"使用模型预测并绘制能带图"}
+                                ]
                             )
 
-                            msg = gr.Textbox(
-                                label="输入消息",
-                                placeholder=f"输入你想对{agent_info['name']}说的话...",
-                                scale=4
-                            )
-                            send_btn = gr.Button("发送", variant="primary", scale=1, interactive=finish)
+                    with gr.Row(equal_height=True):
+                        example = gr.Dropdown(
+                            choices=["-",
+                                     '请帮我生成碳的训练输入配置文件，基组为{"C":"2s1p"}，截断半径{"C":6.0}，训练数据路径"my_data"，前缀"C16"，其余按默认配置',
+                                     "使用poly4基准模型绘制能带图，结构文件为xxx",
+                                     "请帮我生成sp轨道的Si的ploy4基准模型",
+                                     "请使用我的模型预测并绘制能带图"],
+                            value="-",
+                            label="输入对话示例"
+                        )
 
-                            send_btn.click(
-                                fn=handle_send_message,
-                                inputs=[msg, chatbot, session_id_state, tools_info_state],
-                                outputs=[chatbot, chat_status, schema_state, finish_state]
-                            ).then(
-                                lambda: "",  # 清空输入框
-                                outputs=msg
-                            )
+                        send_btn = gr.Button("发送", variant="primary", scale=1)
+                        @gr.render(inputs=finish_state)
+                        def render_input_box(finish):
+                            send_btn.interactive = finish
 
-                            # 回车发送消息
-                            """msg.submit(
-                                fn=handle_send_message,
-                                inputs=[msg, chatbot, session_id_state, tools_info_state],
-                                outputs=[chatbot, chat_status, schema_state]
-                            ).then(
-                                lambda: "",  # 清空输入框
-                                outputs=msg
-                            )"""
+                        msg = gr.Textbox(
+                            label="输入消息",
+                            placeholder=f"输入你想对{agent_info['name']}说的话...",
+                            scale=4
+                        )
 
-                            example.change(
-                                fn=lambda m:m,
-                                inputs=example,
-                                outputs=[msg]
-                            )
+                        send_btn.click(
+                            fn=handle_send_message,
+                            inputs=[msg, session_id_state, tools_info_state],
+                            outputs=[chat_status, finish_state]
+                        ).then(
+                            lambda: "",  # 清空输入框
+                            outputs=msg
+                        )
+
+                        # 回车发送消息
+                        """msg.submit(
+                            fn=handle_send_message,
+                            inputs=[msg, chatbot, session_id_state, tools_info_state],
+                            outputs=[chatbot, chat_status, schema_state]
+                        ).then(
+                            lambda: "",  # 清空输入框
+                            outputs=msg
+                        )"""
+
+                        example.change(
+                            fn=lambda m:m,
+                            inputs=example,
+                            outputs=[msg]
+                        )
 
                 with gr.Column(scale=1) as values_column:
                     gr.Markdown("## 修改运行参数")
@@ -523,11 +578,11 @@ def create_interface(mcp_server_url: str,
                                outputs=[schema_state, _])
 
                     @gr.render(inputs=[schema_state, session_id_state, task_submit_mode_state])
-                    def render_form(schema, _session_id, task_submit_mode):
+                    def render_form(schema:dict, _session_id, task_submit_mode):
                         print("Updating...")
                         gr.Markdown("### 使用的运行参数：")
 
-                        if schema:
+                        if schema and len(schema.keys()) != 0:
                             output_json = gr.JSON(value=schema)
 
                             submit_json_button = gr.Button("通过JSON快速提交")
@@ -624,7 +679,7 @@ def create_interface(mcp_server_url: str,
         login_btn.click(
             fn=login,
             inputs=[session_id, mcp_server_url_state, agent_info_state, work_path_state, model_config_state],
-            outputs=[login_section, chat_section, status_msg, chatbot]
+            outputs=[login_section, chat_section, status_msg]
         ).then(
             lambda _session_id:
             (_session_id,
@@ -633,25 +688,11 @@ def create_interface(mcp_server_url: str,
             outputs=[session_id_state, current_info]
         )
 
-        # 发送消息事件
-        async def handle_send_message(message, history, _session_id, _tools_info):
-            if not message.strip():
-                yield history, "消息不能为空", {}, True
-            else:
-                async for new_history, status, schema, finish in chat_with_agent(message,
-                                                                                 history,
-                                                                                 session_id=_session_id,
-                                                                                 agent_info=agent_info,
-                                                                                 work_path=work_path,
-                                                                                 tools_info=tools_info):
-                    yield new_history, status, schema, finish
-
-
         # 清空对话
         clear_btn.click(
-            fn=lambda sha: ([], "对话已清空"),
+            fn=lambda sha: ("对话已清空"),
             inputs=[session_id_state],
-            outputs=[chatbot, chat_status]
+            outputs=[chat_status]
         )
 
         # 登出按钮事件
@@ -660,8 +701,7 @@ def create_interface(mcp_server_url: str,
             outputs=[
                 login_section,
                 chat_section,
-                status_msg,
-                chatbot
+                status_msg
             ]
         ).then(
             lambda: ("", "", "", "", "未登录"),  # 清空状态

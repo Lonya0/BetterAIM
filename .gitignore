@@ -48,6 +48,10 @@ dpdispatcher.log
 env.json
 chat_history
 
+# AI
+.claude
+CLAUDE.md
+
 
 .DS_Store
 Thumbs.db
